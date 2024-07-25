@@ -1,0 +1,38 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+          <CodeAnalysisRuleset>$(PkgKoek_CodeAnalysis)\content\CodeAnalysis.ruleset</CodeAnalysisRuleset>
+        <EnforceCodeStyleInBuild>True</EnforceCodeStyleInBuild>
+        <EnableNETAnalyzers>True</EnableNETAnalyzers>
+        <AnalysisLevel>preview</AnalysisLevel>
+        <CheckForOverflowUnderflow>True</CheckForOverflowUnderflow>
+        <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
+    </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="SystemPrompt.txt" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="SystemPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Koek" Version="2.0.0" />
+        <PackageReference Include="Koek.CodeAnalysis" Version="2021.1201.19173">
+            <PrivateAssets>all</PrivateAssets>
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="8.7.0" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+        <PackageReference Include="Mono.Options" Version="6.12.0.148" />
+        <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
+    </ItemGroup>
+
+</Project>
