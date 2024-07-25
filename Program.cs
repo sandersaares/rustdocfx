@@ -481,11 +481,11 @@ public sealed class Program : IDisposable
         // Desired format:
         //
         // Crate X
-        //  foo (module)
-        //   struct A
-        //   struct B
-        //   type C
-        //  bar (module)
+        //  Module foo
+        //   Struct A
+        //   Struct B
+        //   Type C
+        //  Module bar
         //
         // Each container-like node is represented by index.html. We assume that all crate/module directories
         // contain an index.html, as this seems to always be present for crates/modules in Rustdoc output.
