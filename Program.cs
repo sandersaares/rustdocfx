@@ -13,6 +13,7 @@ using System.Text;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using Microsoft.Extensions.DependencyInjection;
+using System.Xml.Schema;
 
 namespace Rustdocfx;
 
@@ -50,7 +51,7 @@ public sealed class Program : IDisposable
             // First, we create a map of all the content we find in the Rustdoc output.
             // This will identify each document, categorize it for processing, identify
             // whether it has even changed and determine the Docfx output filename.
-            var inputDocuments = GetInputDocuments(_newHtmlRoot, _oldHtmlRoot);
+            var inputDocuments = GetInputDocuments(_newHtmlRoot, _oldHtmlRoot).ToList();
 
             foreach (var doc in inputDocuments)
             {
@@ -71,6 +72,8 @@ public sealed class Program : IDisposable
             await GenerateOutputAsync(_outputRoot, inputDocuments, GetChatHttpClient(), logger);
 
             // Generate reference documents such as tables of contents.
+            var toc = await GenerateTableOfContentsAsync(inputDocuments, _outputRoot, logger);
+            await File.WriteAllTextAsync(Path.Combine(_outputRoot, "toc.yml"), toc);
 
             // All done!
         }
@@ -97,14 +100,14 @@ public sealed class Program : IDisposable
             {
                 client.BaseAddress = new($"https://{_aiEndpoint}/openai/deployments/{_aiDeployment}/chat/completions?api-version=2024-02-15-preview");
                 client.DefaultRequestHeaders.Add("api-key", _aiKey);
-                client.Timeout = TimeSpan.FromMinutes(5);
+                client.Timeout = TimeSpan.FromMinutes(3);
             });
 
         httpClientBuilder.AddStandardResilienceHandler(options =>
         {
-            options.TotalRequestTimeout.Timeout = TimeSpan.FromMinutes(5);
-            options.AttemptTimeout.Timeout = TimeSpan.FromMinutes(2);
-            options.CircuitBreaker.SamplingDuration = TimeSpan.FromMinutes(4);
+            options.TotalRequestTimeout.Timeout = TimeSpan.FromMinutes(10);
+            options.AttemptTimeout.Timeout = TimeSpan.FromMinutes(3);
+            options.CircuitBreaker.SamplingDuration = TimeSpan.FromMinutes(10);
         });
 
         return services.BuildServiceProvider().GetRequiredService<IHttpClientFactory>().CreateClient("default");
@@ -147,9 +150,10 @@ public sealed class Program : IDisposable
 
             var kind = IdentifyInputDocumentKind(file);
 
-            // Macros are present in the Rustdoc twice, once without the ! and once with the !.
-            // e.g. as "foo!" and as "foo". We only care about the one without the !, so skip the other.
-            if (kind == InputDocumentKind.Macro && Path.GetFileNameWithoutExtension(file).EndsWith("!", StringComparison.Ordinal))
+            // Some documents are simply redirects to a "canonical" path for the item.
+            // We ignore these and only process the canonical file.
+            var contents = File.ReadAllText(file);
+            if (contents.Contains("<meta http-equiv=\"refresh\" ", StringComparison.Ordinal))
                 continue;
 
             var relativePath = Path.GetRelativePath(newHtmlRoot, file);
@@ -308,6 +312,7 @@ public sealed class Program : IDisposable
                 continue;
 
             var outputFilePath = GetOutputDocumentPath(doc, outputRoot);
+            Directory.CreateDirectory(Path.GetDirectoryName(outputFilePath)!);
             var outputContent = await GenerateOutputContentAsync(doc, chatClient, logger);
             File.WriteAllText(outputFilePath, outputContent);
         }
@@ -467,6 +472,182 @@ public sealed class Program : IDisposable
         }
 
         throw new UnreachableCodeException();
+    }
+    #endregion
+
+    #region Auxilliary file generation
+    async Task<string> GenerateTableOfContentsAsync(List<InputDocument> inputDocuments, string outputRoot, ILogger logger)
+    {
+        // Desired format:
+        //
+        // Crate X
+        //  foo (module)
+        //   struct A
+        //   struct B
+        //   type C
+        //  bar (module)
+        //
+        // Each container-like node is represented by index.html. We assume that all crate/module directories
+        // contain an index.html, as this seems to always be present for crates/modules in Rustdoc output.
+
+        // We will not make assumptions about the order of input documents, so we first need to establish relations
+        // between them. We establish two data sets:
+        // * If a document qualifies as a container-like document (because it is named index.html),
+        //   establish the relative path that children can use to lookup this parent document (i.e. the directory name).
+        // * For each parent document, establish a list of children that can be attached to it.
+        var relativePathToParent = new Dictionary<string, InputDocument>();
+        var parentToChildren = new Dictionary<InputDocument, List<InputDocument>>();
+
+        foreach (var doc in inputDocuments)
+        {
+            if (doc.Kind != InputDocumentKind.Crate && doc.Kind != InputDocumentKind.Module)
+            {
+                // This document cannot be a container.
+                continue;
+            }
+
+            relativePathToParent[Path.GetDirectoryName(doc.RelativePath) ?? ""] = doc;
+            parentToChildren[doc] = new List<InputDocument>();
+        }
+
+        // Now we can simply go through every document and attach it to its rightful parent. That creates our document tree.
+        var topLevelDocuments = new List<InputDocument>();
+
+        foreach (var doc in inputDocuments)
+        {
+            var parent = Path.GetDirectoryName(doc.RelativePath) ?? "";
+
+            // If the item itself is already a parent, we need to go up 1 level.
+            if (parentToChildren.ContainsKey(doc))
+            {
+                parent = Path.GetDirectoryName(parent);
+
+                if (parent == null)
+                {
+                    logger.LogDebug($"{doc.RelativePath} is a top level document with no parent.");
+                    topLevelDocuments.Add(doc);
+                    continue;
+                }
+            }
+
+            if (!relativePathToParent.TryGetValue(parent, out var parentDocument))
+            {
+                logger.LogDebug($"{doc.RelativePath} is promoted to top level document because it has no parent.");
+                topLevelDocuments.Add(doc);
+                continue;
+            }
+
+            logger.LogDebug($"Parent ID of {doc.RelativePath} is '{parent}'");
+            parentToChildren[parentDocument].Add(doc);
+        }
+
+        // Now we have our tree of documents and all we need to do is transform it to a tree of TOC nodes.
+        var topLevelTocNodes = await ToTocNodesAsync(topLevelDocuments, parentToChildren, outputRoot);
+
+        // Conert this to DocFX TOC format.
+        var toc = new StringBuilder();
+        AppendTocNodes(toc, level: 0, topLevelTocNodes, outputRoot);
+
+        return toc.ToString();
+    }
+
+    private void AppendTocNodes(StringBuilder toc, int level, List<TocNode> nodes, string outputRoot)
+    {
+        // Format:
+        //- name: Service
+        //  href: Service/
+        //- name: Publishing
+        //  href: Publishing/
+        //- name: Operations
+        //  href: Operations/
+        //- name: Player
+        //  href: Player/
+        //- name: Resource library
+        //  href: Library/
+        //- name: Introduction
+        //  href: Introduction.md
+        //- name: Glossary
+        //  href: Glossary.md
+        //- name: Records and logs
+        //  href: Records/toc.yml
+        //- name: Technical articles
+        //  href: TechnicalArticles/toc.yml
+        //- name: Threat model
+        //  href: ThreatModel/ThreatModel.md
+
+        foreach (var node in nodes.OrderBy(x => x.Name, StringComparer.InvariantCultureIgnoreCase))
+        {
+            var indentation = new string(' ', level * 2);
+            toc.Append(indentation);
+            toc.AppendLine($"- name: {node.Name}");
+
+            var outputRelativeUrl = Path.GetRelativePath(outputRoot, GetOutputDocumentPath(node.Document, outputRoot)).Replace('\\', '/');
+            toc.Append(indentation);
+            toc.AppendLine($"  href: {outputRelativeUrl}");
+
+            // If we have child items, we emit those as an "items" array under this TOC node.
+            if (node.Children.Count != 0)
+            {
+                toc.Append(indentation);
+                toc.AppendLine("  items:");
+
+                AppendTocNodes(toc, level + 1, node.Children, outputRoot);
+            }
+        }
+    }
+
+    private async Task<List<TocNode>> ToTocNodesAsync(IEnumerable<InputDocument> documents, Dictionary<InputDocument, List<InputDocument>> childrenMap, string outputRoot)
+    {
+        var result = new List<TocNode>();
+
+        foreach (var doc in documents)
+            result.Add(await ToTocNodeAsync(doc, childrenMap, outputRoot));
+
+        return result;
+    }
+
+    private async Task<TocNode> ToTocNodeAsync(InputDocument doc, Dictionary<InputDocument, List<InputDocument>> childrenMap, string outputRoot)
+    {
+        var node = new TocNode
+        {
+            Name = await GetTocNodeNameAsync(doc, outputRoot),
+            Document = doc,
+        };
+
+        if (childrenMap.TryGetValue(doc, out var children))
+            node.Children = await ToTocNodesAsync(children, childrenMap, outputRoot);
+
+        return node;
+    }
+
+    private sealed class TocNode
+    {
+        public required string Name { get; init; }
+        public required InputDocument Document { get; init; }
+        public List<TocNode> Children { get; set; } = new();
+    }
+
+    private static readonly string[] TocNameParseHeadingPartSeparators = new[] { "::", " " };
+
+    private async Task<string> GetTocNodeNameAsync(InputDocument doc, string outputRoot)
+    {
+        // We get the name from the output document because it is easier to process Markdown without all the HTML fluff.
+        // The first heading is going to be something like:
+        // # Derive Macro oxidizer_macros::Context
+        //
+        // We want the "Context" from here, so we just find the last "::" or " " and take whatever follows.
+        var outputContent = await File.ReadAllLinesAsync(GetOutputDocumentPath(doc, outputRoot));
+
+        // There may be empty lines before the first heading. Who knows what else there may be - just find the first heading.
+        var headingLine = outputContent.FirstOrDefault(x => x.StartsWith("# ", StringComparison.Ordinal));
+        var lastPart = headingLine?.Split(TocNameParseHeadingPartSeparators, StringSplitOptions.RemoveEmptyEntries).LastOrDefault();
+
+        // If we failed, just use the filename and let the humans figure out what is wrong when they see it.
+        if (lastPart == null)
+            return Path.GetFileNameWithoutExtension(doc.RelativePath);
+
+        // We prefix the last part of the heading with the type of the node.
+        return $"{doc.Kind} {lastPart}";
     }
     #endregion
 
