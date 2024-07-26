@@ -51,7 +51,7 @@ public sealed class Program : IDisposable
             // First, we create a map of all the content we find in the Rustdoc output.
             // This will identify each document, categorize it for processing, identify
             // whether it has even changed and determine the Docfx output filename.
-            var inputDocuments = GetInputDocuments(_newHtmlRoot, _oldHtmlRoot).ToList();
+            var inputDocuments = GetInputDocuments(_newHtmlRoot, _oldHtmlRoot, _outputRoot).ToList();
 
             foreach (var doc in inputDocuments)
             {
@@ -100,13 +100,15 @@ public sealed class Program : IDisposable
             {
                 client.BaseAddress = new($"https://{_aiEndpoint}/openai/deployments/{_aiDeployment}/chat/completions?api-version=2024-02-15-preview");
                 client.DefaultRequestHeaders.Add("api-key", _aiKey);
-                client.Timeout = TimeSpan.FromMinutes(3);
+                // This conflicts with the resilience strategy if set and causes nonretriable failures too eagerly.
+                // Just let the resilience strategy handle all timeout logic.
+                client.Timeout = Timeout.InfiniteTimeSpan;
             });
 
         httpClientBuilder.AddStandardResilienceHandler(options =>
         {
-            options.TotalRequestTimeout.Timeout = TimeSpan.FromMinutes(10);
-            options.AttemptTimeout.Timeout = TimeSpan.FromMinutes(3);
+            options.TotalRequestTimeout.Timeout = TimeSpan.FromMinutes(20);
+            options.AttemptTimeout.Timeout = TimeSpan.FromMinutes(5);
             options.CircuitBreaker.SamplingDuration = TimeSpan.FromMinutes(10);
         });
 
@@ -114,15 +116,15 @@ public sealed class Program : IDisposable
     }
 
     #region Input identification
-    private IEnumerable<InputDocument> GetInputDocuments(string newHtmlRoot, string oldHtmlRoot)
+    private IEnumerable<InputDocument> GetInputDocuments(string newHtmlRoot, string oldHtmlRoot, string outputRoot)
     {
-        return GetInputDocumentsInner(newHtmlRoot, newHtmlRoot, oldHtmlRoot);
+        return GetInputDocumentsInner(newHtmlRoot, newHtmlRoot, oldHtmlRoot, outputRoot);
     }
 
     /// <summary>
     /// Gets the input documents from a single directory (recursively).
     /// </summary>
-    private IEnumerable<InputDocument> GetInputDocumentsInner(string directoryPath, string newHtmlRoot, string oldHtmlRoot)
+    private IEnumerable<InputDocument> GetInputDocumentsInner(string directoryPath, string newHtmlRoot, string oldHtmlRoot, string outputRoot)
     {
         // We special-case the Rustdoc root directory because it contains the list of crates
         // that we will be processing. If we detect we are in the root, we directly process
@@ -131,7 +133,7 @@ public sealed class Program : IDisposable
         // wants to convert one specific module, which we can support with minor hassle).
         if (File.Exists(Path.Combine(directoryPath, "crates.js")))
         {
-            foreach (var doc in GetInputDocumentFromCrates(directoryPath, newHtmlRoot, oldHtmlRoot))
+            foreach (var doc in GetInputDocumentFromCrates(directoryPath, newHtmlRoot, oldHtmlRoot, outputRoot))
                 yield return doc;
 
             yield break;
@@ -163,14 +165,14 @@ public sealed class Program : IDisposable
                 AbsolutePath = file,
                 RelativePath = relativePath,
                 Kind = kind,
-                GenerateOutput = ShouldGenerateOutput(relativePath, newHtmlRoot, oldHtmlRoot)
+                GenerateOutput = ShouldGenerateOutput(relativePath, newHtmlRoot, oldHtmlRoot, outputRoot)
             };
         }
 
         // Any directories here are submodules (only the Rustdoc root has other directories).
         foreach (var module in Directory.GetDirectories(directoryPath))
         {
-            foreach (var doc in GetInputDocumentsInner(module, newHtmlRoot, oldHtmlRoot))
+            foreach (var doc in GetInputDocumentsInner(module, newHtmlRoot, oldHtmlRoot, outputRoot))
                 yield return doc;
         }
     }
@@ -216,7 +218,7 @@ public sealed class Program : IDisposable
         throw new InvalidOperationException($"Failed to identify the kind of document at '{path}'.");
     }
 
-    private IEnumerable<InputDocument> GetInputDocumentFromCrates(string directoryPath, string newHtmlRoot, string oldHtmlRoot)
+    private IEnumerable<InputDocument> GetInputDocumentFromCrates(string directoryPath, string newHtmlRoot, string oldHtmlRoot, string outputRoot)
     {
         var cratesJsPath = Path.Combine(directoryPath, "crates.js");
         var cratesJsContent = File.ReadAllText(cratesJsPath);
@@ -243,12 +245,12 @@ public sealed class Program : IDisposable
             if (!Directory.Exists(crateDirectory))
                 throw new InvalidOperationException($"The crate directory '{crateDirectory}' does not exist.");
 
-            foreach (var doc in GetInputDocumentsInner(crateDirectory, newHtmlRoot, oldHtmlRoot))
+            foreach (var doc in GetInputDocumentsInner(crateDirectory, newHtmlRoot, oldHtmlRoot, outputRoot))
                 yield return doc;
         }
     }
 
-    private bool ShouldGenerateOutput(string relativePath, string newHtmlPath, string oldHtmlPath)
+    private bool ShouldGenerateOutput(string relativePath, string newHtmlPath, string oldHtmlPath, string outputRoot)
     {
         var newDocumentPath = Path.Combine(newHtmlPath, relativePath);
         var oldDocumentPath = Path.Combine(oldHtmlPath, relativePath);
@@ -269,7 +271,11 @@ public sealed class Program : IDisposable
         var oldHash = HashFile(oldDocumentPath);
         var newHash = HashFile(newDocumentPath);
 
-        return oldHash != newHash;
+        if (oldHash != newHash)
+            return true;
+
+        // If both old and new match, we still generate if the output document is missing.
+        return !File.Exists(GetOutputDocumentPath(relativePath, outputRoot));
     }
 
     private ulong HashFile(string path)
@@ -320,7 +326,12 @@ public sealed class Program : IDisposable
 
     private string GetOutputDocumentPath(InputDocument document, string outputRoot)
     {
-        return Path.ChangeExtension(Path.Combine(outputRoot, document.RelativePath), "md");
+        return GetOutputDocumentPath(document.RelativePath, outputRoot);
+    }
+
+    private string GetOutputDocumentPath(string relativePath, string outputRoot)
+    {
+        return Path.ChangeExtension(Path.Combine(outputRoot, relativePath), "md");
     }
 
     private static readonly JsonSerializerOptions JsonSerializerOptions = new()
@@ -421,6 +432,8 @@ public sealed class Program : IDisposable
 
             _totalInputTokens += responsePayload?.Usage?.PromptTokens ?? 0;
             _totalOutputTokens += responsePayload?.Usage?.CompletionTokens ?? 0;
+
+            logger.LogDebug($"Cumulative input tokens: {_totalInputTokens}, output tokens: {_totalOutputTokens}");
 
             var responseMessage = responsePayload?.Choices?.FirstOrDefault()?.Message?.Content;
 
